@@ -35,33 +35,27 @@ impl WGApi<Userspace> {
         let path = self.socket_path();
         let socket = UnixStream::connect(path)?;
         socket.set_read_timeout(Some(SOCKET_TIMEOUT))?;
+        socket.set_write_timeout(Some(SOCKET_TIMEOUT))?;
         Ok(socket)
     }
 
-    // FIXME: currently other errors are ignored and result in 0 being returned.
-    fn parse_errno(buf: impl Read) -> u32 {
-        let reader = BufReader::new(buf);
-        for line_result in reader.lines() {
-            let line = match line_result {
-                Ok(line) => line,
-                Err(err) => {
-                    error!("Error parsing errno buffer line: {err}, continuing with next line.");
-                    continue;
-                }
-            };
-            if let Some((keyword, value)) = line.split_once('=')
-                && keyword == "errno"
-            {
-                match value.parse() {
-                    Ok(errno) => return errno,
-                    Err(err) => {
-                        error!("Failed to parse errno: {err}, using default value 0");
-                        return 0;
-                    }
-                }
-            }
+    // A missing, truncated or malformed acknowledgement is never success.
+    fn parse_errno(buf: impl Read) -> io::Result<u32> {
+        let mut line = String::new();
+        BufReader::new(buf.take(64)).read_line(&mut line)?;
+        let value = line
+            .strip_prefix("errno=")
+            .and_then(|v| v.strip_suffix('\n'))
+            .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "missing UAPI errno response"))?;
+        if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "invalid UAPI errno response",
+            ));
         }
-        0
+        value
+            .parse()
+            .map_err(|_| io::Error::new(ErrorKind::InvalidData, "invalid UAPI errno value"))
     }
 
     /// Read host information using user-space API.
@@ -78,7 +72,7 @@ impl WGApi<Userspace> {
         socket.write_all(host.as_uapi().as_bytes())?;
         socket.write_all(b"\n")?;
 
-        if Self::parse_errno(socket) == 0 {
+        if Self::parse_errno(socket)? == 0 {
             Ok(())
         } else {
             Err(io::Error::new(
@@ -333,7 +327,7 @@ impl WireguardInterfaceApi for WGApi<Userspace> {
         socket.write_all(b"set=1\n")?;
         socket.write_all(peer.as_uapi_update().as_bytes())?;
         socket.write_all(b"\n")?;
-        let errno = Self::parse_errno(socket);
+        let errno = Self::parse_errno(socket)?;
 
         if errno == 0 {
             info!("Peer {peer:?} configured on interface {}", self.ifname);
@@ -358,7 +352,7 @@ impl WireguardInterfaceApi for WGApi<Userspace> {
         )?;
         socket.write_all(b"\n")?;
 
-        let errno = Self::parse_errno(socket);
+        let errno = Self::parse_errno(socket)?;
 
         if errno == 0 {
             info!(
@@ -411,11 +405,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn malformed_or_incomplete_errno_is_never_success() {
+        for reply in [
+            "",
+            "errno=",
+            "errno=0",
+            "errno=bogus\n",
+            "unexpected=0\n",
+            "errno=+0\n",
+        ] {
+            assert!(WGApi::<Userspace>::parse_errno(reply.as_bytes()).is_err());
+        }
+        assert!(
+            WGApi::<Userspace>::parse_errno(format!("errno={}\n", "0".repeat(1000)).as_bytes())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn errno_read_timeout_is_returned_without_retry() {
+        struct Timeout;
+        impl Read for Timeout {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::from(ErrorKind::TimedOut))
+            }
+        }
+        assert_eq!(
+            WGApi::<Userspace>::parse_errno(Timeout).unwrap_err().kind(),
+            ErrorKind::TimedOut
+        );
+    }
+
+    #[test]
     fn test_parse_errno() {
         let buf = Cursor::new(b"errno=0\n");
-        assert_eq!(WGApi::<Userspace>::parse_errno(buf), 0);
+        assert_eq!(WGApi::<Userspace>::parse_errno(buf).unwrap(), 0);
 
         let buf = Cursor::new(b"errno=12345\n");
-        assert_eq!(WGApi::<Userspace>::parse_errno(buf), 12345);
+        assert_eq!(WGApi::<Userspace>::parse_errno(buf).unwrap(), 12345);
     }
 }
