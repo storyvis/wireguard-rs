@@ -78,18 +78,20 @@ impl Host {
 
     // TODO: use custom Error
     pub fn parse_uapi(buf: impl Read) -> io::Result<Self> {
-        let reader = BufReader::new(buf);
+        let mut reader = BufReader::new(buf.take(16 * 1024 * 1024));
         let mut host = Self::default();
         let mut peer_ref = None;
 
-        for line_result in reader.lines() {
-            let line = match line_result {
-                Ok(line) => line,
-                Err(err) => {
-                    error!("Error parsing buffer line: {err}");
-                    continue;
-                }
-            };
+        loop {
+            let mut line = String::new();
+            Read::take(&mut reader, 4097).read_line(&mut line)?;
+            if line.len() > 4096 || !line.ends_with('\n') {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "incomplete or oversized UAPI host response",
+                ));
+            }
+            line.pop();
             if let Some((keyword, value)) = line.split_once('=') {
                 match keyword {
                     "listen_port" => host.listen_port = value.parse().unwrap_or_default(),
@@ -161,8 +163,7 @@ impl Host {
                         if let Ok(errno) = value.parse::<u32>()
                             && errno == 0
                         {
-                            // Break here, or BufReader will wait for EOF.
-                            break;
+                            return Ok(host);
                         }
                         return Err(io::Error::other("error reading UAPI"));
                     }
@@ -170,8 +171,6 @@ impl Host {
                 }
             }
         }
-
-        Ok(host)
     }
 }
 
@@ -253,6 +252,28 @@ mod tests {
     use std::io::Cursor;
 
     use super::*;
+
+    #[test]
+    fn host_requires_complete_acknowledgement_and_bounds_lines() {
+        for reply in ["", "listen_port=443\n", "errno=0", "errno=invalid\n"] {
+            assert!(Host::parse_uapi(reply.as_bytes()).is_err());
+        }
+        assert!(Host::parse_uapi(format!("{}\nerrno=0\n", "a".repeat(4097)).as_bytes()).is_err());
+    }
+
+    #[test]
+    fn host_read_timeout_is_returned_without_retry() {
+        struct Timeout;
+        impl Read for Timeout {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::from(io::ErrorKind::TimedOut))
+            }
+        }
+        assert_eq!(
+            Host::parse_uapi(Timeout).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+    }
 
     #[test]
     fn test_parse_config() {
